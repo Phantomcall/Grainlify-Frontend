@@ -39,7 +39,7 @@ export function validateUrl(value: string): string | true {
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
       return 'URL must start with http:// or https://'
     }
-    if (!url.hostname.includes('.')) {
+    if (!url.hostname) {
       return 'URL must have a valid hostname'
     }
     return true
@@ -58,10 +58,31 @@ export function validateUrl(value: string): string | true {
 export function validateEmail(value: string): string | true {
   const trimmed = value.trim()
   if (!trimmed) return true
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+  if (!/^[^\s@]+@[^\s@.]+(\.[^\s@.]+)+$/.test(trimmed)) {
     return 'Please enter a valid email address'
   }
   return true
+}
+
+/**
+ * Validates that a route-level parameter (like :slug, :projectId, or :issueId)
+ * is well-formed before it is used in API requests.
+ *
+ * A well-formed parameter must:
+ * 1. Be non-empty.
+ * 2. Contain only alphanumeric characters and hyphens (no slashes, dots, or spaces).
+ * 3. Be between 1 and 100 characters in length.
+ *
+ * This check prevents path traversal (../), markup injection, and oversized
+ * input from reaching backend endpoints.
+ *
+ * @param value - The route parameter to validate.
+ * @returns `true` if valid, otherwise `false`.
+ */
+export function isValidRouteParam(value: string | undefined): value is string {
+  if (!value) return false
+  if (value.length > 100) return false
+  return /^[a-zA-Z0-9-]+$/.test(value)
 }
 
 /**

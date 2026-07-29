@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
-import { useTheme } from '../contexts/ThemeContext';
+import { useEffect, useState } from 'react'
+import { useTheme } from '../contexts/ThemeContext'
 
 interface SkeletonLoaderProps {
-  className?: string;
-  variant?: 'default' | 'circle' | 'text';
-  width?: string;
-  height?: string;
+  className?: string
+  variant?: 'default' | 'circle' | 'text'
+  width?: string
+  height?: string
+  /** Overrides the default `data-testid="skeleton-loader"` for callers that need a more specific test hook. */
+  'data-testid'?: string
 }
 
 /**
@@ -20,47 +22,52 @@ interface SkeletonLoaderProps {
  * in the repo, including live updates if the user changes the OS preference
  * at runtime.
  */
-export function SkeletonLoader({ className, variant = 'default', width, height }: SkeletonLoaderProps) {
-  const { theme } = useTheme();
-  const isDark = theme === 'dark';
-  const [reducedMotion, setReducedMotion] = useState(false);
+export function SkeletonLoader({
+  className,
+  variant = 'default',
+  width,
+  height,
+  'data-testid': testId = 'skeleton-loader',
+}: SkeletonLoaderProps) {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+  const [reducedMotion, setReducedMotion] = useState(false)
 
   useEffect(() => {
-    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
-    setReducedMotion(mql.matches);
-    const handler = (e: MediaQueryListEvent) => setReducedMotion(e.matches);
-    mql.addEventListener('change', handler);
-    return () => mql.removeEventListener('change', handler);
-  }, []);
+    const mql = window.matchMedia('(prefers-reduced-motion: reduce)')
+    setReducedMotion(mql.matches)
+    const handler = (e: MediaQueryListEvent) => setReducedMotion(e.matches)
+    mql.addEventListener('change', handler)
+    return () => mql.removeEventListener('change', handler)
+  }, [])
 
   const baseClasses = `relative overflow-hidden ${
     variant === 'circle'
       ? 'rounded-full'
       : variant === 'text'
-      ? 'rounded-[100px]'
-      : 'rounded-[12px]'
-  }`;
+        ? 'rounded-[100px]'
+        : 'rounded-[12px]'
+  }`
 
-  const bgColor = isDark
-    ? 'bg-white/[0.08]'
-    : 'bg-white/[0.12]';
+  const bgColor = isDark ? 'bg-white/[0.08]' : 'bg-white/[0.12]'
 
   const shimmerGradient = isDark
     ? 'from-transparent via-white/[0.15] to-transparent'
-    : 'from-transparent via-white/[0.25] to-transparent';
+    : 'from-transparent via-white/[0.25] to-transparent'
 
-  const style: React.CSSProperties = {};
-  if (width) style.width = width;
-  if (height) style.height = height;
+  const style: React.CSSProperties = {}
+  if (width) style.width = width
+  if (height) style.height = height
 
   return (
     <div
       className={`${baseClasses} ${bgColor} ${className || ''}`}
       style={style}
+      data-testid={testId}
     >
       <div
         className={`absolute inset-0 -translate-x-full bg-gradient-to-r ${shimmerGradient}${reducedMotion ? '' : ' animate-shimmer'}`}
       />
     </div>
-  );
+  )
 }

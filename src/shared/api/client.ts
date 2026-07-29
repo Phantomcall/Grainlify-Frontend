@@ -3,7 +3,7 @@
  */
 
 import { API_BASE_URL } from '../config/api'
-import { BillingProfile } from '../../features/settings/types'
+import { BillingProfile, NotificationSettings } from '../../features/settings/types'
 import { BlogPost } from '../../features/blog/types'
 
 // Token management
@@ -27,6 +27,20 @@ export const removeAuthToken = (): void => {
   }
 }
 
+/**
+ * Emits a `patchwork-auth-401` CustomEvent so that the app layer (e.g.
+ * AuthContext) can redirect the user to sign-in while preserving the current
+ * location as `returnTo`. Kept separate from `removeAuthToken` so that
+ * `client.ts` remains free of any router imports.
+ *
+ * @internal Only called by `apiRequest` and `downloadInvoice` on HTTP 401.
+ */
+export const emit401Event = (): void => {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('patchwork-auth-401'))
+  }
+}
+
 // API request helper
 /**
  * Options for API requests extending standard RequestInit
@@ -38,12 +52,145 @@ export interface ApiRequestOptions extends RequestInit {
 }
 
 /**
- * Core API request helper that handles authentication, headers, and error handling
+ * Default retry delay in seconds when the `Retry-After` header is absent on a
+ * 429 response. Chosen to be safe for public polling endpoints.
+ */
+export const DEFAULT_RETRY_AFTER_SECONDS = 60
+
+/**
+ * Parses the `Retry-After` response header into a number of seconds.
+ *
+ * Supports both formats defined by RFC 9110:
+ * - **Delay-seconds** – a non-negative integer, e.g. `"30"`
+ * - **HTTP-date** – an absolute date/time, e.g. `"Wed, 21 Oct 2025 07:28:00 GMT"`
+ *
+ * The returned value is clamped to a finite non-negative number so that
+ * attacker-controlled header values cannot pass an unexpected delay to
+ * `setTimeout` or similar callers.
+ *
+ * @param headerValue - Raw value of the `Retry-After` header, or `null` if absent.
+ * @returns Retry delay in seconds; falls back to {@link DEFAULT_RETRY_AFTER_SECONDS} when
+ *   the header is absent, unparseable, negative, or non-finite.
+ */
+export function parseRetryAfter(headerValue: string | null): number {
+  if (headerValue === null || headerValue.trim() === '') {
+    return DEFAULT_RETRY_AFTER_SECONDS
+  }
+
+  const trimmed = headerValue.trim()
+
+  // Try numeric (delay-seconds) format first. A negative-but-finite number is
+  // still a well-formed delay-seconds value — just out of range — so it
+  // should fall back to the default rather than be misinterpreted below by
+  // the lenient `Date.parse`, which happily (and wrongly) accepts strings
+  // like "-10" as a legacy date format.
+  const numeric = Number(trimmed)
+  if (!isNaN(numeric) && isFinite(numeric)) {
+    return numeric >= 0 ? Math.floor(numeric) : DEFAULT_RETRY_AFTER_SECONDS
+  }
+
+  // Try HTTP-date format
+  const parsed = Date.parse(trimmed)
+  if (!isNaN(parsed)) {
+    const delaySecs = Math.floor((parsed - Date.now()) / 1000)
+    return delaySecs > 0 ? delaySecs : 0
+  }
+
+  return DEFAULT_RETRY_AFTER_SECONDS
+}
+
+/**
+ * Error thrown when the API responds with HTTP 429 Too Many Requests.
+ *
+ * Callers can inspect `retryAfterSeconds` to implement back-off logic without
+ * hammering the API further.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await getLeaderboard();
+ * } catch (err) {
+ *   if (err instanceof RateLimitError) {
+ *     console.warn(`Rate limited. Retry after ${err.retryAfterSeconds}s`);
+ *   }
+ * }
+ * ```
+ */
+export class RateLimitError extends Error {
+  /** Number of seconds the caller should wait before retrying. */
+  readonly retryAfterSeconds: number
+
+  constructor(retryAfterSeconds: number) {
+    super(
+      `Rate limit exceeded. Please retry after ${retryAfterSeconds} second${retryAfterSeconds === 1 ? '' : 's'}.`
+    )
+    this.name = 'RateLimitError'
+    this.retryAfterSeconds = retryAfterSeconds
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Retry / backoff configuration
+// ---------------------------------------------------------------------------
+
+/** HTTP status codes that are safe to auto-retry (transient server/infra errors). */
+const RETRYABLE_STATUSES = new Set([502, 503])
+
+/** Maximum number of attempts (1 initial + 2 retries). */
+export const MAX_RETRY_ATTEMPTS = 3
+
+/** Base delay in milliseconds for exponential backoff. */
+export const RETRY_BASE_DELAY_MS = 500
+
+/**
+ * Returns the delay (in ms) to wait before retry attempt number `attempt`
+ * (1-indexed, so `attempt=1` is the first retry).
+ *
+ * Uses exponential backoff: `baseDelay * 2^(attempt-1)`
+ *   attempt 1 → 500 ms
+ *   attempt 2 → 1 000 ms
+ *
+ * When `retryAfterMs` is provided and positive it takes precedence (used to
+ * honour a `Retry-After` header returned by the server).
+ */
+export function getRetryDelay(attempt: number, retryAfterMs?: number): number {
+  if (retryAfterMs !== undefined && retryAfterMs > 0) {
+    return retryAfterMs
+  }
+  return RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+}
+
+/**
+ * Resolves after `ms` milliseconds.
+ *
+ * Uses the global `setTimeout` so Vitest's `vi.useFakeTimers()` can advance
+ * time without waiting for real wall-clock delays.
+ */
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Core API request helper that handles authentication, headers, error handling,
+ * and automatic retry with exponential backoff for transient failures.
+ *
+ * **Retry policy**
+ * - 502 / 503 and network errors (`TypeError` from `fetch`) are retried up to
+ *   `MAX_RETRY_ATTEMPTS` times with exponential back-off via `getRetryDelay`.
+ * - 429 is **not** auto-retried; a `RateLimitError` is thrown immediately so
+ *   callers can implement their own back-off strategy.
+ * - 4xx errors other than 429 are never retried.
+ *
  * @template T - The expected response type
  * @param {string} endpoint - API endpoint path (will be prefixed with API_BASE_URL)
  * @param {ApiRequestOptions} options - Request options including auth requirements
  * @returns {Promise<T>} Parsed JSON response
- * @throws {Error} On network failures, authentication errors, or non-2xx responses
+ * @throws {RateLimitError} When the server responds with 429 Too Many Requests.
+ *   The error exposes `retryAfterSeconds` parsed from the `Retry-After` header
+ *   (numeric or HTTP-date), falling back to {@link DEFAULT_RETRY_AFTER_SECONDS}.
+ * @throws {Error} On network failures, authentication errors, or other non-2xx responses
  * @internal This function is exported for testing purposes
  */
 export async function apiRequest<T>(endpoint: string, options: ApiRequestOptions = {}): Promise<T> {
@@ -58,9 +205,16 @@ export async function apiRequest<T>(endpoint: string, options: ApiRequestOptions
   // Content-Type when we actually send a JSON body.
   const method = (fetchOptions.method || 'GET').toUpperCase()
   const hasBody = fetchOptions.body !== undefined && fetchOptions.body !== null
-  if (hasBody && !(fetchOptions.body instanceof FormData)) {
+  const isFormData = hasBody && fetchOptions.body instanceof FormData
+
+  if (hasBody && !isFormData) {
     requestHeaders['Content-Type'] = 'application/json'
-  } else if (method !== 'GET' && method !== 'HEAD' && !('Content-Type' in requestHeaders)) {
+  } else if (
+    method !== 'GET' &&
+    method !== 'HEAD' &&
+    !isFormData &&
+    !('Content-Type' in requestHeaders)
+  ) {
     // Non-GET/HEAD without an explicit content-type: default to JSON for our API.
     requestHeaders['Content-Type'] = 'application/json'
   }
@@ -73,65 +227,100 @@ export async function apiRequest<T>(endpoint: string, options: ApiRequestOptions
     }
   }
 
-  let response: Response
-  try {
-    response = await fetch(url, {
-      ...fetchOptions,
-      headers: requestHeaders,
-    })
-  } catch (err) {
-    // Network error (CORS, connection refused, etc.)
-    if (err instanceof TypeError && err.message.includes('fetch')) {
-      throw new Error(
-        'Network error: Unable to connect to the server. Please check your connection.'
-      )
-    }
-    throw err
-  }
+  let lastError: Error | undefined
 
-  // Handle errors
-  if (!response.ok) {
-    if (response.status === 401) {
-      // Token expired or invalid - clear it
-      removeAuthToken()
-      throw new Error('Authentication failed. Please sign in again.')
+  for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+    // Wait before retries (not before the first attempt).
+    if (attempt > 0) {
+      await sleep(getRetryDelay(attempt))
     }
 
-    if (response.status === 403) {
-      let errorMsg: string
+    let response: Response
+    try {
+      response = await fetch(url, {
+        ...fetchOptions,
+        headers: requestHeaders,
+      })
+    } catch (err) {
+      // Network error (CORS, connection refused, etc.) — retryable.
+      if (err instanceof TypeError && err.message.includes('fetch')) {
+        lastError = new Error(
+          'Network error: Unable to connect to the server. Please check your connection.'
+        )
+        continue
+      }
+      throw err
+    }
+
+    // Handle errors
+    if (!response.ok) {
+      if (response.status === 401) {
+        // Token expired or invalid - clear it and signal the app layer to redirect.
+        // Not retryable.
+        removeAuthToken()
+        emit401Event()
+        throw new Error('Authentication failed. Please sign in again.')
+      }
+
+      if (response.status === 403) {
+        // Permission errors are not retryable.
+        let errorMsg: string
+        try {
+          const errorData = await response.json()
+          errorMsg = errorData.message || errorData.error || 'Access forbidden'
+        } catch {
+          errorMsg = 'Access forbidden'
+        }
+        throw new Error(
+          `Permission denied: ${errorMsg}. You may need admin privileges to perform this action.`
+        )
+      }
+
+      if (response.status === 429) {
+        // Rate limited — surface immediately as RateLimitError; callers handle back-off.
+        const retryAfterSeconds = parseRetryAfter(response.headers.get('Retry-After'))
+        throw new RateLimitError(retryAfterSeconds)
+      }
+
+      // 502 / 503 are retryable transient server errors.
+      if (RETRYABLE_STATUSES.has(response.status)) {
+        let errMsg: string
+        try {
+          const errorData = await response.json()
+          errMsg = errorData.message || errorData.error || 'API request failed'
+        } catch {
+          errMsg = `API request failed with status ${response.status}`
+        }
+        lastError = new Error(errMsg)
+        continue
+      }
+
+      // Any other non-2xx status — non-retryable, fail immediately.
+      let apiErrorMsg: string
       try {
         const errorData = await response.json()
-        errorMsg = errorData.message || errorData.error || 'Access forbidden'
+        apiErrorMsg = errorData.message || errorData.error || 'API request failed'
       } catch {
-        errorMsg = 'Access forbidden'
+        throw new Error(`API request failed with status ${response.status}`)
       }
-      throw new Error(
-        `Permission denied: ${errorMsg}. You may need admin privileges to perform this action.`
-      )
+      throw new Error(apiErrorMsg)
     }
 
-    // Try to parse error response
-    let apiErrorMsg: string
+    // Parse JSON response
     try {
-      const errorData = await response.json()
-      apiErrorMsg = errorData.message || errorData.error || 'API request failed'
-    } catch {
-      throw new Error(`API request failed with status ${response.status}`)
+      const jsonData = await response.json()
+      return jsonData
+    } catch (err) {
+      // If response is empty or not JSON, return empty array for list endpoints
+      if (endpoint.includes('/projects/mine') || endpoint.includes('/projects')) {
+        return [] as T
+      }
+      throw new Error('Invalid response from server')
     }
-    throw new Error(apiErrorMsg)
   }
 
-  // Parse JSON response
-  try {
-    const jsonData = await response.json()
-    return jsonData
-  } catch (err) {
-    // If response is empty or not JSON, return empty array for list endpoints
-    if (endpoint.includes('/projects/mine') || endpoint.includes('/projects')) {
-      return [] as T
-    }
-    throw new Error('Invalid response from server')
-  }
+  // All attempts exhausted — throw the last recorded error.
+  throw lastError ?? new Error('API request failed after retries')
 }
 
 // API Methods
@@ -149,6 +338,47 @@ export type LandingStats = {
 }
 
 export const getLandingStats = () => apiRequest<LandingStats>('/stats/landing')
+
+// Analytics
+export interface ActivityDataPoint {
+  month: string
+  value: number
+  trend: number
+  new: number
+  reactivated: number
+  active: number
+  churned: number
+  prMerged: number
+  rewarded: number
+}
+
+export interface ContributorRegion {
+  name: string
+  value: number
+  percentage: number
+}
+
+export interface AnalyticsStats {
+  billing_profile_count: number
+  total_contributor_count: number
+  active_contributor_count: number
+  total_count: number
+}
+
+export const getProjectActivity = (interval: string) =>
+  apiRequest<ActivityDataPoint[]>(
+    `/stats/project-activity?interval=${encodeURIComponent(interval)}`
+  )
+
+export const getContributorActivity = (interval: string) =>
+  apiRequest<ActivityDataPoint[]>(
+    `/stats/contributor-activity?interval=${encodeURIComponent(interval)}`
+  )
+
+export const getContributorsByRegion = () =>
+  apiRequest<ContributorRegion[]>('/stats/contributors-by-region')
+
+export const getAnalyticsStats = () => apiRequest<AnalyticsStats>('/stats/analytics-summary')
 
 // Authentication
 export const getCurrentUser = () =>
@@ -258,6 +488,73 @@ export const getProfileActivity = (limit = 50, offset = 0, userId?: string, logi
     offset: number
   }>(`/profile/activity?${params.toString()}`, { requiresAuth: true })
 }
+
+export type ProfileReward = {
+  id: string | number
+  date?: string | null
+  created_at?: string | null
+  awarded_at?: string | null
+  project_name?: string | null
+  project?: string | null
+  project_logo?: string | null
+  owner_avatar_url?: string | null
+  contributor_login?: string | null
+  from?: string | null
+  contribution_title?: string | null
+  contribution?: string | null
+  amount?: number | string | null
+  currency?: string | null
+  status?: string | null
+}
+
+/**
+ * Fetch the authenticated user's reward history.
+ *
+ * @returns Reward records for the current profile. The UI normalizes nullable
+ * fields defensively before rendering so incomplete API rows cannot leak
+ * placeholder text such as `"undefined"` into the rewards table.
+ */
+export const getProfileRewards = () =>
+  apiRequest<{ rewards: ProfileReward[] }>('/profile/rewards', { requiresAuth: true })
+
+export type ProfileContribution = {
+  id: string | number
+  title?: string | null
+  status?: string | null
+  project_name?: string | null
+  project?: string | null
+  repository?: string | null
+  github_full_name?: string | null
+  contributor_login?: string | null
+  author_login?: string | null
+  badge?: string | number | null
+  issue_number?: number | null
+  number?: number | null
+  tag?: string | null
+  label?: string | null
+  labels?: Array<string | { name?: string | null }> | null
+  url?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  submitted_at?: string | null
+  merged_at?: string | null
+  rewarded?: boolean | null
+  is_rewarded?: boolean | null
+  reward_status?: string | null
+  amount?: number | string | null
+}
+
+/**
+ * Fetches the authenticated contributor's board items.
+ *
+ * @returns API contribution rows for the Applied, Assigned, Pending Review,
+ * and Complete board. The UI normalizes nullable fields before rendering so
+ * repository-supplied text is displayed as escaped React text, never HTML.
+ */
+export const getProfileContributions = () =>
+  apiRequest<{ contributions: ProfileContribution[] }>('/profile/contributions', {
+    requiresAuth: true,
+  })
 
 export const getProjectsContributed = (userId?: string, login?: string) => {
   const params = new URLSearchParams()
@@ -456,6 +753,7 @@ export const getPublicProjectIssues = (projectId: string) =>
       url: string
       updated_at: string | null
       last_seen_at: string
+      deadline?: string | null
     }>
   }>(`/projects/${projectId}/issues/public`)
 
@@ -953,43 +1251,80 @@ export const syncProject = (projectId: string) =>
     method: 'POST',
   })
 
-// Project Data (Issues and PRs)
-export const getProjectIssues = (projectId: string) =>
-  apiRequest<{
-    issues: Array<{
-      github_issue_id: number
-      number: number
-      state: string
-      title: string
-      description: string | null
-      author_login: string
-      assignees: any[]
-      labels: any[]
-      comments_count: number
-      comments: any[]
-      url: string
-      updated_at: string | null
-      last_seen_at: string
-    }>
-  }>(`/projects/${projectId}/issues`, { requiresAuth: true })
+export interface MaintainerComment {
+  id: number
+  body: string
+  user: {
+    login: string
+  }
+  created_at: string
+  updated_at: string
+}
 
-export const getProjectPRs = (projectId: string) =>
-  apiRequest<{
-    prs: Array<{
-      github_pr_id: number
-      number: number
-      state: string
-      title: string
-      author_login: string
-      url: string
-      merged: boolean
-      created_at: string | null
-      updated_at: string | null
-      closed_at: string | null
-      merged_at: string | null
-      last_seen_at: string
-    }>
-  }>(`/projects/${projectId}/prs`, { requiresAuth: true })
+export interface MaintainerIssue {
+  github_issue_id: number
+  number: number
+  state: string
+  title: string
+  description: string | null
+  author_login: string
+  assignees: any[]
+  labels: any[]
+  comments_count: number
+  comments: MaintainerComment[]
+  url: string
+  updated_at: string | null
+  last_seen_at: string
+}
+
+export interface MaintainerPR {
+  github_pr_id: number
+  number: number
+  state: string
+  title: string
+  author_login: string
+  url: string
+  merged: boolean
+  created_at: string | null
+  updated_at: string | null
+  closed_at: string | null
+  merged_at: string | null
+  last_seen_at: string
+}
+
+/**
+ * Fetches the list of issues for a specific project.
+ * Requires maintainer authentication (requiresAuth: true).
+ *
+ * @param projectId - The unique identifier of the project
+ * @param options - Optional API request options (e.g. AbortSignal)
+ * @returns Promise resolving to an object containing the project's issues
+ * @throws {Error} If authentication fails or the request is unauthorized
+ */
+export const getMaintainerIssues = (projectId: string, options?: ApiRequestOptions) =>
+  apiRequest<{ issues: MaintainerIssue[] }>(`/projects/${projectId}/issues`, {
+    requiresAuth: true,
+    ...options,
+  })
+
+/**
+ * Fetches the list of pull requests for a specific project.
+ * Requires maintainer authentication (requiresAuth: true).
+ *
+ * @param projectId - The unique identifier of the project
+ * @param options - Optional API request options (e.g. AbortSignal)
+ * @returns Promise resolving to an object containing the project's pull requests
+ * @throws {Error} If authentication fails or the request is unauthorized
+ */
+export const getMaintainerPRs = (projectId: string, options?: ApiRequestOptions) =>
+  apiRequest<{ prs: MaintainerPR[] }>(`/projects/${projectId}/prs`, {
+    requiresAuth: true,
+    ...options,
+  })
+
+// Project Data (Issues and PRs) - Deprecated/Wrapper
+export const getProjectIssues = (projectId: string) => getMaintainerIssues(projectId)
+export const getProjectPRs = (projectId: string) => getMaintainerPRs(projectId)
 
 export const applyToIssue = (projectId: string, issueNumber: number, message: string) =>
   apiRequest<{
@@ -1048,4 +1383,76 @@ export const rejectApplication = (projectId: string, issueNumber: number, assign
     requiresAuth: true,
     method: 'POST',
     body: JSON.stringify({ assignee }),
+  })
+
+/**
+ * Downloads an invoice PDF for the given invoice ID.
+ *
+ * Uses a raw fetch (not `apiRequest`) because the endpoint returns a binary
+ * blob rather than JSON. Mirrors the same auth and error-handling shape as
+ * `apiRequest`: attaches the Bearer token, throws a typed Error on 401 (and
+ * clears the stored token), and throws on any other non-2xx status.
+ *
+ * @param invoiceId - The invoice `id` from the {@link Invoice} type.
+ * @returns The PDF content as a `Blob`.
+ * @throws {Error} On network failure, auth error, or non-2xx response.
+ */
+export async function downloadInvoice(invoiceId: string): Promise<Blob> {
+  const url = `${API_BASE_URL}/billing/invoices/${invoiceId}/download`
+  const headers: Record<string, string> = {}
+
+  const token = getAuthToken()
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
+  let response: Response
+  try {
+    response = await fetch(url, { headers })
+  } catch (err) {
+    if (err instanceof TypeError && err.message.includes('fetch')) {
+      throw new Error(
+        'Network error: Unable to connect to the server. Please check your connection.'
+      )
+    }
+    throw err
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      removeAuthToken()
+      emit401Event()
+      throw new Error('Authentication failed. Please sign in again.')
+    }
+    throw new Error(`Failed to download invoice (${response.status}).`)
+  }
+
+  return response.blob()
+}
+
+export const getTermsStatus = () =>
+  apiRequest<{ accepted: boolean; version: string | null; accepted_at: string | null }>(
+    '/profile/terms',
+    {
+      requiresAuth: true,
+    }
+  )
+
+export const acceptTerms = (version: string) =>
+  apiRequest<{ ok: boolean; accepted_at: string; version: string }>('/profile/terms', {
+    requiresAuth: true,
+    method: 'POST',
+    body: JSON.stringify({ version }),
+  })
+
+export const getNotificationSettings = () =>
+  apiRequest<NotificationSettings>('/profile/notifications', {
+    requiresAuth: true,
+  })
+
+export const updateNotificationSettings = (settings: NotificationSettings) =>
+  apiRequest<{ ok: boolean }>('/profile/notifications', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+    requiresAuth: true,
   })
